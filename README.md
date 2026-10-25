@@ -13,12 +13,15 @@ The tile shows only the remote video. WhatsApp's title bar and call buttons are 
 1. Start a WhatsApp video call.
 2. Open **WhatsApp PiP**.
 3. If macOS shows a window picker, click **Share This Window** on the call. This only sends the call window to the PiP tile on your own Mac. Nothing is shared with the other person.
+4. Switch to another app. The tile appears.
+
+The tile works like FaceTime's picture-in-picture. It hides while WhatsApp is the active app and appears as soon as you switch to any other app.
 
 | Action | What it does |
 | --- | --- |
+| Click | Go back to the full WhatsApp call (switching to its Space if the call is full screen); the tile hides |
 | Drag | Move the tile |
 | Drag an edge | Resize (keeps the video's aspect ratio) |
-| Double-click | Bring the full WhatsApp call window to the front |
 | Right-click | Show call / Quit |
 
 The tile closes itself when the call ends. While it runs, the purple screen-capture icon shows in the menu bar.

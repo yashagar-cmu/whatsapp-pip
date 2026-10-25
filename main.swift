@@ -1,12 +1,13 @@
 // WhatsApp PiP: mirrors the live WhatsApp call window into a small floating,
 // draggable, resizable picture-in-picture tile that stays above every app and Space.
 //
+//   click           go back to the WhatsApp call (the tile hides)
 //   drag            move the tile
 //   drag an edge    resize (aspect ratio is kept)
-//   double-click    bring the WhatsApp call window to the front
 //   right-click     menu (show call, quit)
 //
-// The tile closes itself when the call ends.
+// The tile hides while WhatsApp is the active app and reappears as soon as you
+// switch to any other app. It closes itself when the call ends.
 
 import AppKit
 import ScreenCaptureKit
@@ -43,7 +44,7 @@ func videoRect(_ pb: CVPixelBuffer) -> CGRect? {
 }
 
 final class PiPView: NSView {
-    var onDoubleClick: (() -> Void)?
+    var onClick: (() -> Void)?
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -53,8 +54,12 @@ final class PiPView: NSView {
     }
     required init?(coder: NSCoder) { fatalError() }
 
+    // A press that doesn't move the tile is a click; anything else was a drag.
     override func mouseDown(with event: NSEvent) {
-        if event.clickCount == 2 { onDoubleClick?() } else { window?.performDrag(with: event) }
+        guard let window else { return }
+        let before = window.frame.origin
+        window.performDrag(with: event)
+        if window.frame.origin == before { onClick?() }
     }
 }
 
@@ -64,6 +69,7 @@ final class PiPPanel: NSPanel {
 
 final class Mirror: NSObject, SCStreamOutput, SCStreamDelegate, SCContentSharingPickerObserver {
     let view: PiPView
+    var onStarted: (() -> Void)?
     var stream: SCStream?
     var windowID: CGWindowID?
     var lastFrame: CGRect = .zero
@@ -168,7 +174,7 @@ final class Mirror: NSObject, SCStreamOutput, SCStreamDelegate, SCContentSharing
         }
         stream = s
         fitPanel(to: size)
-        view.window?.orderFrontRegardless()
+        onStarted?()
     }
 
     @MainActor func fitPanel(to size: CGSize) {
@@ -234,10 +240,6 @@ final class Mirror: NSObject, SCStreamOutput, SCStreamDelegate, SCContentSharing
     }
 }
 
-func showCall() {
-    NSRunningApplication.runningApplications(withBundleIdentifier: whatsAppID).first?.activate()
-}
-
 @MainActor func fail(_ message: String) {
     NSApp.activate(ignoringOtherApps: true)
     let alert = NSAlert()
@@ -271,7 +273,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let view = PiPView(frame: NSRect(origin: .zero, size: rect.size))
         view.autoresizingMask = [.width, .height]
-        view.onDoubleClick = showCall
+        view.onClick = { [weak self] in self?.showCall() }
         let menu = NSMenu()
         menu.addItem(withTitle: "Show WhatsApp Call", action: #selector(showCallAction), keyEquivalent: "").target = self
         menu.addItem(.separator())
@@ -280,7 +282,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.contentView = view
 
         mirror = Mirror(view: view)
+        mirror.onStarted = { [weak self] in
+            self?.updateVisibility(frontmost: NSWorkspace.shared.frontmostApplication)
+        }
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
+        ) { [weak self] note in
+            self?.updateVisibility(frontmost: note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)
+        }
         mirror.start()
+    }
+
+    /// Hidden while WhatsApp is in front, shown over every other app.
+    func updateVisibility(frontmost: NSRunningApplication?) {
+        guard mirror.stream != nil, let frontmost, frontmost != .current else { return }
+        if frontmost.bundleIdentifier == whatsAppID {
+            panel.orderOut(nil)
+        } else {
+            panel.orderFrontRegardless()
+        }
+    }
+
+    /// Hide the tile and switch to WhatsApp (and its Space, if the call is full screen).
+    func showCall() {
+        guard let whatsApp = NSRunningApplication.runningApplications(withBundleIdentifier: whatsAppID).first else { return }
+        panel.orderOut(nil)
+        // The tile never activates this app, so ask to become active first and hand activation over.
+        NSApp.activate()
+        whatsApp.activate(from: .current)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+            guard NSWorkspace.shared.frontmostApplication != whatsApp, let url = whatsApp.bundleURL else { return }
+            NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration())
+        }
     }
 
     @objc func showCallAction() { showCall() }
