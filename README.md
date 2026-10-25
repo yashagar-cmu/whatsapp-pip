@@ -15,11 +15,11 @@ The tile shows only the remote video. WhatsApp's title bar and call buttons are 
 3. If macOS shows a window picker, click **Share This Window** on the call. This only sends the call window to the PiP tile on your own Mac. Nothing is shared with the other person.
 4. Switch to another app. The tile appears.
 
-The tile works like FaceTime's picture-in-picture. It hides while WhatsApp is the active app and appears as soon as you switch to any other app.
+The tile works like FaceTime's picture-in-picture. It hides while the call window is the window you're using. It appears as soon as you switch to another app or to another WhatsApp window, such as your chats.
 
 | Action | What it does |
 | --- | --- |
-| Click | Go back to the full WhatsApp call (switching to its Space if the call is full screen); the tile hides |
+| Click | Go back to the call window (switching to its Space if the call is full screen); the tile hides |
 | Drag | Move the tile |
 | Drag an edge | Resize (keeps the video's aspect ratio) |
 | Right-click | Show call / Quit |
@@ -27,6 +27,12 @@ The tile works like FaceTime's picture-in-picture. It hides while WhatsApp is th
 The tile closes itself when the call ends. While it runs, the purple screen-capture icon shows in the menu bar.
 
 To let the big call window go behind other windows, turn off **Call → Always On Top** in WhatsApp (⌃⌘T).
+
+### Click goes straight to the call
+
+The first time you click the tile, macOS asks to give **WhatsApp PiP** Accessibility access. Allow it in System Settings → Privacy & Security → Accessibility. The app uses it only to bring the call window itself to the front. Without it, a click switches to WhatsApp, which may show your chats window instead of the call.
+
+The app is signed ad hoc, so macOS treats every rebuild as a new app. After running `./build.sh`, turn the permission off and on again.
 
 ### Skip the picker
 
