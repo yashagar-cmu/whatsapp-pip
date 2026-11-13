@@ -1,21 +1,34 @@
-// WhatsApp PiP: mirrors the live WhatsApp call window into a small floating,
-// draggable, resizable picture-in-picture tile that stays above every app and Space.
+// WhatsApp PiP: mirrors a live WhatsApp or FaceTime video call window into a small
+// floating, draggable, resizable picture-in-picture tile that stays above every app and Space.
 //
-//   click           go back to the WhatsApp call (the tile hides)
+//   click           go back to the call (the tile hides)
 //   drag            move the tile
 //   drag an edge    resize (aspect ratio is kept)
 //   right-click     menu (show call, quit)
 //
 // The tile hides while the call window is the window you're looking at, and
-// reappears as soon as you switch to another app or another WhatsApp window
-// (e.g. your chats). It closes itself when the call ends.
+// reappears as soon as you switch to another app or another window of the
+// calling app (e.g. your WhatsApp chats). It closes itself when the call ends.
 
 import AppKit
 import ApplicationServices
 import ScreenCaptureKit
 import CoreMedia
 
-let whatsAppID = "net.whatsapp.WhatsApp"
+/// An app whose video calls can be mirrored, and the window chrome around its video, in points.
+struct CallApp {
+    let bundleID: String
+    let name: String
+    let cropTop: CGFloat
+    let cropBottom: CGFloat
+}
+
+let whatsApp = CallApp(bundleID: "net.whatsapp.WhatsApp", name: "WhatsApp", cropTop: 32, cropBottom: 60)
+// FaceTime's video fills its window; the controls only appear while the pointer is over it.
+let faceTime = CallApp(bundleID: "com.apple.FaceTime", name: "FaceTime", cropTop: 0, cropBottom: 0)
+let callApps = [whatsApp, faceTime]
+
+func callApp(for bundleID: String?) -> CallApp? { callApps.first { $0.bundleID == bundleID } }
 
 // Maps an accessibility window to its CGWindowID (private but long-stable; used by yabai, AltTab, …).
 @_silgen_name("_AXUIElementGetWindow")
@@ -47,11 +60,37 @@ func raise(window id: CGWindowID, of pid: pid_t) -> Bool {
     }
     return false
 }
-// Fixed chrome of WhatsApp's call window, in points: title bar on top, call controls at the bottom.
-// Any black letterboxing left around the video is trimmed per frame.
-let cropTop: CGFloat = 32, cropBottom: CGFloat = 60, cropSide: CGFloat = 0
 
-/// Unit rect of the non-black area of a BGRA frame, kept centred (WhatsApp letterboxes symmetrically).
+/// Whether window `id` of `pid` has an "End" (hang up) button. Tells FaceTime's call window apart from
+/// its main window, which shares the title "FaceTime". Needs Accessibility; without it, says yes.
+func hasEndCallButton(window id: CGWindowID, of pid: pid_t) -> Bool {
+    guard AXIsProcessTrusted() else { return true }
+    func children(_ e: AXUIElement) -> [AXUIElement] {
+        var v: CFTypeRef?
+        AXUIElementCopyAttributeValue(e, kAXChildrenAttribute as CFString, &v)
+        return v as? [AXUIElement] ?? []
+    }
+    func isEnd(_ e: AXUIElement) -> Bool {
+        var role: CFTypeRef?, title: CFTypeRef?, desc: CFTypeRef?
+        AXUIElementCopyAttributeValue(e, kAXRoleAttribute as CFString, &role)
+        guard role as? String == kAXButtonRole else { return false }
+        AXUIElementCopyAttributeValue(e, kAXTitleAttribute as CFString, &title)
+        AXUIElementCopyAttributeValue(e, kAXDescriptionAttribute as CFString, &desc)
+        return title as? String == "End" || desc as? String == "End"
+    }
+    func search(_ e: AXUIElement, depth: Int) -> Bool {
+        isEnd(e) || (depth > 0 && children(e).contains { search($0, depth: depth - 1) })
+    }
+    var value: CFTypeRef?
+    AXUIElementCopyAttributeValue(AXUIElementCreateApplication(pid), kAXWindowsAttribute as CFString, &value)
+    for w in value as? [AXUIElement] ?? [] {
+        var wid: CGWindowID = 0
+        if _AXUIElementGetWindow(w, &wid) == .success, wid == id { return search(w, depth: 8) }
+    }
+    return true
+}
+
+/// Unit rect of the non-black area of a BGRA frame, kept centred (call apps letterbox symmetrically).
 func videoRect(_ pb: CVPixelBuffer) -> CGRect? {
     CVPixelBufferLockBaseAddress(pb, .readOnly)
     defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
@@ -104,6 +143,7 @@ final class Mirror: NSObject, SCStreamOutput, SCStreamDelegate, SCContentSharing
     let view: PiPView
     var onStarted: (() -> Void)?
     var stream: SCStream?
+    var app = whatsApp
     var windowID: CGWindowID?
     var lastFrame: CGRect = .zero
     var poll: Timer?
@@ -119,13 +159,13 @@ final class Mirror: NSObject, SCStreamOutput, SCStreamDelegate, SCContentSharing
             Task { await self.startAutomatically() }
         } else {
             // No Screen Recording permission: the system window picker works without it.
-            // Only the WhatsApp call window is offered, so nothing else can be picked by mistake.
+            // Only call windows are offered, so nothing else can be picked by mistake.
             let picker = SCContentSharingPicker.shared
             var cfg = SCContentSharingPickerConfiguration()
             cfg.allowedPickerModes = [.singleWindow]
             cfg.excludedBundleIDs = NSWorkspace.shared.runningApplications
-                .compactMap(\.bundleIdentifier).filter { $0 != whatsAppID }
-            cfg.excludedWindowIDs = otherWhatsAppWindows().map { Int($0) }
+                .compactMap(\.bundleIdentifier).filter { callApp(for: $0) == nil }
+            cfg.excludedWindowIDs = (otherWhatsAppWindows() + otherFaceTimeWindows()).map { Int($0) }
             picker.defaultConfiguration = cfg
             picker.add(self)
             picker.isActive = true
@@ -136,7 +176,7 @@ final class Mirror: NSObject, SCStreamOutput, SCStreamDelegate, SCContentSharing
     /// WhatsApp windows other than the call window (chat list, menus, …).
     func otherWhatsAppWindows() -> [CGWindowID] {
         guard let list = CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as? [[String: Any]] else { return [] }
-        let pid = NSRunningApplication.runningApplications(withBundleIdentifier: whatsAppID).first?.processIdentifier
+        let pid = NSRunningApplication.runningApplications(withBundleIdentifier: whatsApp.bundleID).first?.processIdentifier
         let mine = list.filter { ($0[kCGWindowOwnerPID as String] as? pid_t) == pid }
         let isCall: ([String: Any]) -> Bool = {
             (($0[kCGWindowName as String] as? String) ?? "").localizedCaseInsensitiveContains("call")
@@ -145,11 +185,22 @@ final class Mirror: NSObject, SCStreamOutput, SCStreamDelegate, SCContentSharing
         return mine.filter { !isCall($0) }.compactMap { $0[kCGWindowNumber as String] as? CGWindowID }
     }
 
+    /// FaceTime windows other than the call window (its main window). Only known with Accessibility.
+    func otherFaceTimeWindows() -> [CGWindowID] {
+        guard AXIsProcessTrusted(),
+              let pid = NSRunningApplication.runningApplications(withBundleIdentifier: faceTime.bundleID).first?.processIdentifier,
+              let list = CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as? [[String: Any]] else { return [] }
+        return list.filter { ($0[kCGWindowOwnerPID as String] as? pid_t) == pid }
+            .compactMap { $0[kCGWindowNumber as String] as? CGWindowID }
+            .filter { !hasEndCallButton(window: $0, of: pid) }
+    }
+
     func startAutomatically() async {
-        guard let window = await findCallWindow() else {
-            await MainActor.run { fail("No WhatsApp video call window found. Start the call first.") }
+        guard let window = await findCallWindow(), let found = callApp(for: window.owningApplication?.bundleIdentifier) else {
+            await MainActor.run { fail("No WhatsApp or FaceTime video call found. Start the call first.") }
             return
         }
+        app = found
         windowID = window.windowID
         lastFrame = window.frame
         let filter = SCContentFilter(desktopIndependentWindow: window)
@@ -162,13 +213,27 @@ final class Mirror: NSObject, SCStreamOutput, SCStreamDelegate, SCContentSharing
         }
     }
 
+    /// A WhatsApp or FaceTime call window, preferring the app you're using, then WhatsApp.
     func findCallWindow() async -> SCWindow? {
         guard let content = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false) else { return nil }
-        let windows = content.windows.filter {
-            $0.owningApplication?.bundleIdentifier == whatsAppID && $0.frame.width > 200 && $0.frame.height > 200
+        let windows = content.windows.filter { $0.windowLayer == 0 && $0.frame.width > 200 && $0.frame.height > 200 }
+        func calls(_ app: CallApp) -> [SCWindow] {
+            let mine = windows.filter { $0.owningApplication?.bundleIdentifier == app.bundleID }
+            if app.bundleID == faceTime.bundleID {
+                return mine.filter { w in
+                    w.isOnScreen && hasEndCallButton(window: w.windowID, of: w.owningApplication!.processID)
+                }
+            }
+            let titled = mine.filter { ($0.title ?? "").localizedCaseInsensitiveContains("call") }
+            return titled.isEmpty ? mine : titled
         }
-        let calls = windows.filter { ($0.title ?? "").localizedCaseInsensitiveContains("call") }
-        return (calls.isEmpty ? windows : calls).max { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height }
+        let front = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+        for app in callApps.filter({ $0.bundleID == front }) + callApps.filter({ $0.bundleID != front }) {
+            if let w = calls(app).max(by: { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height }) {
+                return w
+            }
+        }
+        return nil
     }
 
     func refresh() async {
@@ -185,9 +250,9 @@ final class Mirror: NSObject, SCStreamOutput, SCStreamDelegate, SCContentSharing
     }
 
     func config(for size: CGSize) -> SCStreamConfiguration {
-        let src = CGRect(x: cropSide, y: cropTop,
-                         width: max(100, size.width - 2 * cropSide),
-                         height: max(100, size.height - cropTop - cropBottom))
+        let src = CGRect(x: 0, y: app.cropTop,
+                         width: max(100, size.width),
+                         height: max(100, size.height - app.cropTop - app.cropBottom))
         let cfg = SCStreamConfiguration()
         cfg.sourceRect = src
         cfg.width = Int(src.width * 2)
@@ -207,11 +272,19 @@ final class Mirror: NSObject, SCStreamOutput, SCStreamDelegate, SCContentSharing
         }
         stream = s
         fitPanel(to: size)
+        // Start with the tile's longer side 340pt, so portrait calls (common on FaceTime) aren't huge.
+        if let panel = view.window, sourceSize.height > sourceSize.width {
+            var f = panel.frame
+            let w = 340 * sourceSize.width / sourceSize.height
+            f.origin.x = f.maxX - w
+            f.size = NSSize(width: w, height: 340)
+            panel.setFrame(f, display: true)
+        }
         onStarted?()
     }
 
     @MainActor func fitPanel(to size: CGSize) {
-        sourceSize = CGSize(width: max(100, size.width - 2 * cropSide), height: max(100, size.height - cropTop - cropBottom))
+        sourceSize = CGSize(width: max(100, size.width), height: max(100, size.height - app.cropTop - app.cropBottom))
         applyAspect()
     }
 
@@ -256,11 +329,13 @@ final class Mirror: NSObject, SCStreamOutput, SCStreamDelegate, SCContentSharing
 
     func contentSharingPicker(_ picker: SCContentSharingPicker, didUpdateWith filter: SCContentFilter, for stream: SCStream?) {
         picker.isActive = false
-        guard filter.includedWindows.contains(where: { $0.owningApplication?.bundleIdentifier == whatsAppID }) else {
-            DispatchQueue.main.async { fail("That wasn't the WhatsApp call window. Reopen WhatsApp PiP and pick the call.") }
+        guard let window = filter.includedWindows.first(where: { callApp(for: $0.owningApplication?.bundleIdentifier) != nil }),
+              let picked = callApp(for: window.owningApplication?.bundleIdentifier) else {
+            DispatchQueue.main.async { fail("That wasn't a WhatsApp or FaceTime call. Reopen WhatsApp PiP and pick the call.") }
             return
         }
-        windowID = filter.includedWindows.first { $0.owningApplication?.bundleIdentifier == whatsAppID }?.windowID
+        app = picked
+        windowID = window.windowID
         let size = filter.contentRect.size
         DispatchQueue.main.async { self.run(filter: filter, size: size) }
     }
@@ -310,7 +385,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         view.autoresizingMask = [.width, .height]
         view.onClick = { [weak self] in self?.showCall() }
         let menu = NSMenu()
-        menu.addItem(withTitle: "Show WhatsApp Call", action: #selector(showCallAction), keyEquivalent: "").target = self
+        menu.addItem(withTitle: "Show Call", action: #selector(showCallAction), keyEquivalent: "").target = self
         menu.addItem(.separator())
         menu.addItem(withTitle: "Quit PiP", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         view.menu = menu
@@ -321,7 +396,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
         ) { [weak self] _ in self?.updateVisibility() }
-        // Switching between WhatsApp's own windows sends no notification, so also check a few times a second.
+        // Switching between one app's own windows sends no notification, so also check a few times a second.
         Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in self?.updateVisibility() }
         mirror.start()
     }
@@ -329,7 +404,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Hidden while the call window is the front window of the active app, shown otherwise.
     func updateVisibility() {
         guard mirror.stream != nil, let front = NSWorkspace.shared.frontmostApplication, front != .current else { return }
-        let callInFront = front.bundleIdentifier == whatsAppID
+        let callInFront = front.bundleIdentifier == mirror.app.bundleID
             && (mirror.windowID == nil || frontWindow(of: front.processIdentifier) == mirror.windowID)
         if callInFront {
             if panel.isVisible { panel.orderOut(nil) }
@@ -340,22 +415,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Hide the tile and bring the call window to the front (switching to its Space if it's full screen).
     func showCall() {
-        guard let whatsApp = NSRunningApplication.runningApplications(withBundleIdentifier: whatsAppID).first else { return }
-        let pid = whatsApp.processIdentifier
+        guard let callApp = NSRunningApplication.runningApplications(withBundleIdentifier: mirror.app.bundleID).first else { return }
+        let pid = callApp.processIdentifier
         panel.orderOut(nil)
-        quietUntil = Date() + 0.8  // don't flash back while WhatsApp and the call window come forward
-        // Raising the call window itself (not just WhatsApp's last-used window) needs Accessibility;
-        // the first click asks for it, and until then this just switches to WhatsApp.
+        quietUntil = Date() + 0.8  // don't flash back while the app and its call window come forward
+        // Raising the call window itself (not just the app's last-used window) needs Accessibility;
+        // the first click asks for it, and until then this just switches to the app.
         if !AXIsProcessTrusted() {
             AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue(): true] as CFDictionary)
         }
         if let id = mirror.windowID { raise(window: id, of: pid) }
         // The tile never activates this app, so ask to become active first and hand activation over.
         NSApp.activate()
-        whatsApp.activate(from: .current)
+        callApp.activate(from: .current)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
             if let id = self?.mirror.windowID { raise(window: id, of: pid) }
-            guard NSWorkspace.shared.frontmostApplication != whatsApp, let url = whatsApp.bundleURL else { return }
+            guard NSWorkspace.shared.frontmostApplication != callApp, let url = callApp.bundleURL else { return }
             NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration())
         }
     }
